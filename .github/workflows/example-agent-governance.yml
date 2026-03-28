@@ -1,0 +1,332 @@
+name: Example Agent Governance PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "**/*.yml"
+      - "**/*.yaml"
+      - "**/*.py"
+      - "pyproject.toml"
+      - "requirements/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: example-agent-governance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance-checks:
+    name: Policy + Compliance Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install governance toolkit
+        run: |
+          # Use registered package names to avoid dependency confusion.
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir "agent-governance-toolkit[full]" "agent-os-kernel"
+
+      - name: Collect changed policy files
+        id: changed-policies
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                per_page: 100,
+              }
+            );
+
+            const policyFiles = files
+              .filter((f) => f.status !== 'removed')
+              .map((f) => f.filename)
+              .filter((name) => /(policy|policies)/i.test(name) && /\.ya?ml$/i.test(name));
+
+            core.setOutput('count', String(policyFiles.length));
+            core.setOutput('files_json', JSON.stringify(policyFiles));
+
+      - name: Validate changed policy files
+        id: policy
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.changed-policies.outputs.count }}" = "0" ]; then
+            {
+              echo "status=pass"
+              echo "validated_count=0"
+              echo "failed_count=0"
+              echo "details=No changed policy YAML files detected in this PR."
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          export FILES_JSON='${{ steps.changed-policies.outputs.files_json }}'
+          export WORKSPACE_DIR="$GITHUB_WORKSPACE"
+          export OUTPUT_FILE="$GITHUB_OUTPUT"
+
+          python - << 'PY'
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+workspace = pathlib.Path(os.environ["WORKSPACE_DIR"]).resolve()
+output_file = os.environ["OUTPUT_FILE"]
+files = json.loads(os.environ["FILES_JSON"])
+
+safe_relpath = re.compile(r"^[A-Za-z0-9._/\-]+$")
+validated = 0
+failed = 0
+details = []
+
+for raw in files:
+    if not isinstance(raw, str):
+        failed += 1
+        details.append(f"- FAIL: {raw!r} (invalid filename type)")
+        continue
+
+    if any(ch in raw for ch in ("\x00", "\n", "\r", "\t")):
+        failed += 1
+        details.append(f"- FAIL: {raw!r} (control characters are not allowed)")
+        continue
+
+    if not safe_relpath.fullmatch(raw):
+        failed += 1
+        details.append(f"- FAIL: {raw} (contains unsupported characters)")
+        continue
+
+    rel = pathlib.PurePosixPath(raw)
+    if rel.is_absolute() or ".." in rel.parts:
+        failed += 1
+        details.append(f"- FAIL: {raw} (path traversal / absolute path blocked)")
+        continue
+
+    candidate = (workspace / pathlib.Path(*rel.parts)).resolve()
+    if workspace not in candidate.parents and candidate != workspace:
+        failed += 1
+        details.append(f"- FAIL: {raw} (resolved outside workspace)")
+        continue
+
+    if not candidate.exists() or not candidate.is_file():
+        details.append(f"- SKIP: {raw} (file not present in checkout)")
+        continue
+
+    validated += 1
+    proc = subprocess.run(
+        [sys.executable, "-m", "agent_os.policies.cli", "validate", str(candidate)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        details.append(f"- PASS: {raw}")
+    else:
+        failed += 1
+        details.append(f"- FAIL: {raw}")
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        if stderr:
+            details.extend([f"  {line}" for line in stderr.splitlines()])
+
+status = "pass" if failed == 0 else "fail"
+body = "\n".join(details) if details else "No details available."
+
+with open(output_file, "a", encoding="utf-8") as fh:
+    fh.write(f"status={status}\n")
+    fh.write(f"validated_count={validated}\n")
+    fh.write(f"failed_count={failed}\n")
+    fh.write("details<<EOF\n")
+    fh.write(body + "\n")
+    fh.write("EOF\n")
+
+sys.exit(0 if failed == 0 else 1)
+PY
+
+      - name: Run compliance verification
+        id: compliance
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPLIANCE_JSON="$RUNNER_TEMP/compliance.json"
+          COMPLIANCE_ERR="$RUNNER_TEMP/compliance.err"
+          export COMPLIANCE_JSON
+
+          if agent-governance verify --json >"$COMPLIANCE_JSON" 2>"$COMPLIANCE_ERR"; then
+            status="pass"
+          else
+            status="fail"
+          fi
+
+          summary=$(python - << 'PY'
+import json
+from pathlib import Path
+import os
+
+path = Path(os.environ['COMPLIANCE_JSON'])
+if not path.exists() or path.stat().st_size == 0:
+    print('Compliance report not available (command failed before JSON output).')
+else:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        print('Compliance report exists but is not valid JSON.')
+    else:
+        passed = data.get('controls_passed', 'n/a')
+        total = data.get('controls_total', 'n/a')
+        grade = data.get('grade', 'n/a')
+        print(f'Controls: {passed}/{total} | Grade: {grade}')
+PY
+)
+
+          {
+            echo "status=$status"
+            echo "summary=$summary"
+            echo "details<<EOF"
+            if [ -s "$COMPLIANCE_ERR" ]; then
+              sed 's/^/  /' "$COMPLIANCE_ERR"
+            else
+              echo "  No stderr output from compliance command."
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$status" = "fail" ]; then
+            cat "$COMPLIANCE_ERR" || true
+            exit 1
+          fi
+
+      - name: Build PR report
+        id: report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POLICY_STATUS="${{ steps.policy.outputs.status || 'fail' }}"
+          POLICY_VALIDATED="${{ steps.policy.outputs.validated_count || '0' }}"
+          POLICY_FAILED="${{ steps.policy.outputs.failed_count || '0' }}"
+          POLICY_DETAILS="${{ steps.policy.outputs.details || 'No details available.' }}"
+
+          COMPLIANCE_STATUS="${{ steps.compliance.outputs.status || 'fail' }}"
+          COMPLIANCE_SUMMARY="${{ steps.compliance.outputs.summary || 'No summary available.' }}"
+          COMPLIANCE_DETAILS="${{ steps.compliance.outputs.details || 'No details available.' }}"
+
+          if [ "$POLICY_STATUS" = "pass" ]; then
+            POLICY_ICON="PASS"
+          else
+            POLICY_ICON="FAIL"
+          fi
+
+          if [ "$COMPLIANCE_STATUS" = "pass" ]; then
+            COMP_ICON="PASS"
+          else
+            COMP_ICON="FAIL"
+          fi
+
+          {
+            echo "<!-- agent-governance-example-report -->"
+            echo "## Agent Governance PR Report"
+            echo
+            echo "This report was generated automatically for this PR."
+            echo
+            echo "### Policy Validation"
+            echo "- Status: $POLICY_ICON"
+            echo "- Files validated: $POLICY_VALIDATED"
+            echo "- Failed: $POLICY_FAILED"
+            echo
+            echo "Details:"
+            echo
+            echo '```text'
+            printf "%b\n" "$POLICY_DETAILS"
+            echo '```'
+            echo
+            echo "### Compliance Check"
+            echo "- Status: $COMP_ICON"
+            echo "- Summary: $COMPLIANCE_SUMMARY"
+            echo
+            echo "Command output:"
+            echo
+            echo '```text'
+            printf "%b\n" "$COMPLIANCE_DETAILS"
+            echo '```'
+            echo
+            echo "_Generated by .github/workflows/example-agent-governance.yml_"
+          } > "$RUNNER_TEMP/governance-report.md"
+
+      - name: Add job summary
+        if: always()
+        shell: bash
+        run: |
+          cat "$RUNNER_TEMP/governance-report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment results on PR
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(`${process.env.RUNNER_TEMP}/governance-report.md`, 'utf8');
+            const marker = '<!-- agent-governance-example-report -->';
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            const existing = comments.data.find((c) =>
+              c.user?.type === 'Bot' && c.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail job when checks fail
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy_status="${{ steps.policy.outputs.status || 'fail' }}"
+          compliance_status="${{ steps.compliance.outputs.status || 'fail' }}"
+
+          if [ "$policy_status" != "pass" ] || [ "$compliance_status" != "pass" ]; then
+            echo "One or more governance checks failed."
+            exit 1
+          fi
