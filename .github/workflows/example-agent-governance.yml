@@ -62,7 +62,7 @@ jobs:
               .filter((name) => /(policy|policies)/i.test(name) && /\.ya?ml$/i.test(name));
 
             core.setOutput('count', String(policyFiles.length));
-            core.setOutput('files', policyFiles.join('\n'));
+            core.setOutput('files_json', JSON.stringify(policyFiles));
 
       - name: Validate changed policy files
         id: policy
@@ -81,47 +81,87 @@ jobs:
             exit 0
           fi
 
-          validated=0
-          failed=0
-          details=""
+          export FILES_JSON='${{ steps.changed-policies.outputs.files_json }}'
+          export WORKSPACE_DIR="$GITHUB_WORKSPACE"
+          export OUTPUT_FILE="$GITHUB_OUTPUT"
 
-          printf '%s\n' "${{ steps.changed-policies.outputs.files }}" > /tmp/changed_policy_files.txt
+          python - << 'PY'
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
 
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
+workspace = pathlib.Path(os.environ["WORKSPACE_DIR"]).resolve()
+output_file = os.environ["OUTPUT_FILE"]
+files = json.loads(os.environ["FILES_JSON"])
 
-            if [ ! -f "$file" ]; then
-              details+="- SKIP: $file (file not present in checkout)\n"
-              continue
-            fi
+safe_relpath = re.compile(r"^[A-Za-z0-9._/\-]+$")
+validated = 0
+failed = 0
+details = []
 
-            validated=$((validated + 1))
+for raw in files:
+    if not isinstance(raw, str):
+        failed += 1
+        details.append(f"- FAIL: {raw!r} (invalid filename type)")
+        continue
 
-            if python -m agent_os.policies.cli validate "$file" >/tmp/policy.out 2>&1; then
-              details+="- PASS: $file\n"
-            else
-              failed=$((failed + 1))
-              details+="- FAIL: $file\n"
-              details+="$(sed 's/^/  /' /tmp/policy.out)\n"
-            fi
-          done < /tmp/changed_policy_files.txt
+    if any(ch in raw for ch in ("\x00", "\n", "\r", "\t")):
+        failed += 1
+        details.append(f"- FAIL: {raw!r} (control characters are not allowed)")
+        continue
 
-          if [ "$failed" -gt 0 ]; then
-            status="fail"
-          else
-            status="pass"
-          fi
+    if not safe_relpath.fullmatch(raw):
+        failed += 1
+        details.append(f"- FAIL: {raw} (contains unsupported characters)")
+        continue
 
-          {
-            echo "status=$status"
-            echo "validated_count=$validated"
-            echo "failed_count=$failed"
-            echo "details<<EOF"
-            printf "%b" "$details"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+    rel = pathlib.PurePosixPath(raw)
+    if rel.is_absolute() or ".." in rel.parts:
+        failed += 1
+        details.append(f"- FAIL: {raw} (path traversal / absolute path blocked)")
+        continue
 
-          [ "$failed" -eq 0 ]
+    candidate = (workspace / pathlib.Path(*rel.parts)).resolve()
+    if workspace not in candidate.parents and candidate != workspace:
+        failed += 1
+        details.append(f"- FAIL: {raw} (resolved outside workspace)")
+        continue
+
+    if not candidate.exists() or not candidate.is_file():
+        details.append(f"- SKIP: {raw} (file not present in checkout)")
+        continue
+
+    validated += 1
+    proc = subprocess.run(
+        [sys.executable, "-m", "agent_os.policies.cli", "validate", str(candidate)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        details.append(f"- PASS: {raw}")
+    else:
+        failed += 1
+        details.append(f"- FAIL: {raw}")
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        if stderr:
+            details.extend([f"  {line}" for line in stderr.splitlines()])
+
+status = "pass" if failed == 0 else "fail"
+body = "\n".join(details) if details else "No details available."
+
+with open(output_file, "a", encoding="utf-8") as fh:
+    fh.write(f"status={status}\n")
+    fh.write(f"validated_count={validated}\n")
+    fh.write(f"failed_count={failed}\n")
+    fh.write("details<<EOF\n")
+    fh.write(body + "\n")
+    fh.write("EOF\n")
+
+sys.exit(0 if failed == 0 else 1)
+PY
 
       - name: Run compliance verification
         id: compliance
@@ -129,8 +169,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          COMPLIANCE_JSON="$RUNNER_TEMP/compliance.json"
+          COMPLIANCE_ERR="$RUNNER_TEMP/compliance.err"
+          export COMPLIANCE_JSON
 
-          if agent-governance verify --json >/tmp/compliance.json 2>/tmp/compliance.err; then
+          if agent-governance verify --json >"$COMPLIANCE_JSON" 2>"$COMPLIANCE_ERR"; then
             status="pass"
           else
             status="fail"
@@ -139,8 +182,9 @@ jobs:
           summary=$(python - << 'PY'
 import json
 from pathlib import Path
+import os
 
-path = Path('/tmp/compliance.json')
+path = Path(os.environ['COMPLIANCE_JSON'])
 if not path.exists() or path.stat().st_size == 0:
     print('Compliance report not available (command failed before JSON output).')
 else:
@@ -160,8 +204,8 @@ PY
             echo "status=$status"
             echo "summary=$summary"
             echo "details<<EOF"
-            if [ -s /tmp/compliance.err ]; then
-              sed 's/^/  /' /tmp/compliance.err
+            if [ -s "$COMPLIANCE_ERR" ]; then
+              sed 's/^/  /' "$COMPLIANCE_ERR"
             else
               echo "  No stderr output from compliance command."
             fi
@@ -169,7 +213,7 @@ PY
           } >> "$GITHUB_OUTPUT"
 
           if [ "$status" = "fail" ]; then
-            cat /tmp/compliance.err || true
+            cat "$COMPLIANCE_ERR" || true
             exit 1
           fi
 
